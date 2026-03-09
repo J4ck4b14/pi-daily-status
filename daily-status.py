@@ -23,7 +23,19 @@ MIN_DELAY = 0
 MAX_DELAY = 8 * 60 * 60   # up to 8 hours after cron starts
 
 PING_TARGET = "1.1.1.1"
-WEATHER_CITIES = ["Madrid", "Barcelona"]
+CITY_CONFIG = {
+    "Madrid": {
+	"municipio_id": "28079",
+	"warning_zone": "Metropolitana y Henares",
+	"warnings_page": "https://www.aemet.es/es/eltiempo/prediccion/avisos?k=mad",
+    },
+    "Barcelona": {
+	"municipio_id": "08019",
+	"warning_zone": "Litoral de Barcelona",
+	"warnings_page": "https://www.aemet.es/es/eltiempo/prediccion/avisos?k=cat",
+    },
+}
+
 
 COMMIT_MESSAGES = [
     "Add daily system and weather report",
@@ -259,39 +271,184 @@ def fetch_json(url, timeout=20):
         return json.loads(response.read().decode("utf-8"))
 
 
+def fetch_text(url, timeout=20):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read()
+
+    for encoding in ("utf-8", "iso-8859-15", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return raw.decode("latin-1", errors="replace")
+
+
+def aemet_daily_xml_url(municipio_id):
+    return f"https://www.aemet.es/xml/municipios/localidad_{municipio_id}.xml"
+
+
+def aemet_hourly_xml_url(municipio_id):
+    # AEMET hourly municipality XML follows this pattern for municipality IDs.
+    return f"https://www.aemet.es/xml/municipios_h/localidad_h_{municipio_id}.xml"
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def to_int(value):
+    text = clean_text(value)
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def strip_html_tags(text):
+    text = re.sub(r"<script.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def get_today_dia_node(root):
+    today_str = datetime.date.today().isoformat()
+
+    for dia in root.findall(".//dia"):
+        fecha = dia.attrib.get("fecha", "")
+        if fecha.startswith(today_str):
+            return dia
+
+    dias = root.findall(".//dia")
+    return dias[0] if dias else None
+
+
+def parse_condition_from_dia(dia):
+    descriptions = []
+
+    for node in dia.findall(".//estado_cielo"):
+        desc = clean_text(node.attrib.get("descripcion"))
+        if desc and desc not in descriptions:
+            descriptions.append(desc)
+
+    if descriptions:
+        return descriptions[0]
+
+    return "Unavailable"
+
+
+def parse_max_min_from_dia(dia):
+    maxima = clean_text(dia.findtext(".//temperatura/maxima")) or "N/A"
+    minima = clean_text(dia.findtext(".//temperatura/minima")) or "N/A"
+    return maxima, minima
+
+
+def parse_rain_chance_from_dia(dia):
+    values = []
+
+    for node in dia.findall(".//prob_precipitacion"):
+        value = to_int(node.text)
+        if value is not None:
+            values.append(value)
+
+    return max(values) if values else "N/A"
+
+
+def parse_feels_like_from_hourly_xml(xml_text):
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return "N/A"
+
+    today_str = datetime.date.today().isoformat()
+    current_hour = datetime.datetime.now().hour
+
+    best_value = None
+    best_distance = None
+
+    for dia in root.findall(".//dia"):
+        fecha = dia.attrib.get("fecha", "")
+        if not fecha.startswith(today_str):
+            continue
+
+        for node in dia.findall(".//sens_termica/dato"):
+            hour_attr = node.attrib.get("hora")
+            value = clean_text(node.text)
+
+            if not hour_attr or not value:
+                continue
+
+            try:
+                hour = int(hour_attr)
+            except ValueError:
+                continue
+
+            distance = abs(hour - current_hour)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_value = value
+
+    return best_value if best_value else "N/A"
+
+
+def get_warning_summary(page_url, zone_name):
+    try:
+        html_text = fetch_text(page_url, timeout=20)
+        text = strip_html_tags(html_text)
+
+        if "sin avisos" in text.lower() or "no hay avisos" in text.lower():
+            return "None reported"
+
+        idx = text.lower().find(zone_name.lower())
+        if idx == -1:
+            return "None reported"
+
+        start = max(0, idx - 160)
+        end = min(len(text), idx + 220)
+        snippet = text[start:end].strip(" -:;,.")
+        snippet = re.sub(r"\s+", " ", snippet)
+
+        return snippet if snippet else "Warning present"
+    except Exception as e:
+        return f"Unavailable ({e.__class__.__name__})"
+
+
 def get_weather_for_city(city):
-    encoded_city = urllib.parse.quote(city)
-    url = f"https://wttr.in/{encoded_city}?format=j1"
+    config = CITY_CONFIG[city]
 
     try:
-        data = fetch_json(url)
+        daily_xml = fetch_text(aemet_daily_xml_url(config["municipio_id"]), timeout=20)
+        root = ET.fromstring(daily_xml)
+        dia = get_today_dia_node(root)
 
-        current = data["current_condition"][0]
-        today = data["weather"][0]
+        if dia is None:
+            raise ValueError("No forecast day found")
 
-        condition = current["weatherDesc"][0]["value"]
-        feels_like = current.get("FeelsLikeC", "N/A")
-        max_temp = today.get("maxtempC", "N/A")
-        min_temp = today.get("mintempC", "N/A")
+        condition = parse_condition_from_dia(dia)
+        max_temp, min_temp = parse_max_min_from_dia(dia)
+        chance_of_rain = parse_rain_chance_from_dia(dia)
 
-        hourly = today.get("hourly", [])
-        chance_of_rain_values = []
+        try:
+            hourly_xml = fetch_text(aemet_hourly_xml_url(config["municipio_id"]), timeout=20)
+            feels_like = parse_feels_like_from_hourly_xml(hourly_xml)
+        except Exception:
+            feels_like = "N/A"
 
-        for block in hourly:
-            value = block.get("chanceofrain")
-            if value is not None and str(value).isdigit():
-                chance_of_rain_values.append(int(value))
-
-        chance_of_rain = max(chance_of_rain_values) if chance_of_rain_values else "N/A"
-
-        warnings = []
-        for possible_key in ["alerts", "warnings", "weather_alerts"]:
-            extra = data.get(possible_key)
-            if extra:
-                if isinstance(extra, list):
-                    warnings.extend(str(item) for item in extra)
-                else:
-                    warnings.append(str(extra))
+        warnings = get_warning_summary(
+            config["warnings_page"],
+            config["warning_zone"]
+        )
 
         return {
             "city": city,
@@ -300,7 +457,7 @@ def get_weather_for_city(city):
             "min_temp": min_temp,
             "feels_like": feels_like,
             "chance_of_rain": chance_of_rain,
-            "warnings": "None reported" if not warnings else " | ".join(warnings)
+            "warnings": warnings,
         }
 
     except Exception as e:
@@ -311,8 +468,39 @@ def get_weather_for_city(city):
             "min_temp": "N/A",
             "feels_like": "N/A",
             "chance_of_rain": "N/A",
-            "warnings": f"Unavailable ({e.__class__.__name__})"
+            "warnings": f"Unavailable ({e.__class__.__name__})",
         }
+
+def build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports=None):
+    warnings = []
+
+    if disk["pct"] is not None:
+        if disk["pct"] >= 90:
+            warnings.append(f"Disk usage critical ({disk['pct']:.1f}%)")
+        elif disk["pct"] >= 80:
+            warnings.append(f"Disk usage high ({disk['pct']:.1f}%)")
+
+    if cpu_temp["value"] is not None:
+        if cpu_temp["value"] >= 80:
+            warnings.append(f"CPU temperature critical ({cpu_temp['value']:.1f}°C)")
+        elif cpu_temp["value"] >= 70:
+            warnings.append(f"CPU temperature high ({cpu_temp['value']:.1f}°C)")
+
+    if voltage["issues"]:
+        warnings.append(f"Power issue detected: {voltage['text']}")
+
+    if not reachability["reachable"]:
+        warnings.append("Internet unreachable")
+
+    if weather_reports:
+        for report in weather_reports:
+            if report["condition"] == "Unavailable":
+                warnings.append(f"Weather data unavailable for {report['city']}")
+
+    return {
+        "overall": "Warning" if warnings else "Good",
+        "warnings": warnings
+    }
 
 
 def ensure_month_file():
@@ -360,6 +548,11 @@ def build_health_summary(disk, cpu_temp, voltage, reachability):
 
     if not reachability["reachable"]:
         warnings.append("Internet unreachable")
+
+    if weather_reports:
+        for report in weather_reports:
+            if report["condition"] == "Unavailable":
+                warnings.append(f"Weather data unavailable for {report['city']}")
 
     return {
         "overall": "Warning" if warnings else "Good",
@@ -426,8 +619,8 @@ def build_entry():
     voltage = get_voltage_status()
     reachability = get_reachability()
 
-    weather_reports = [get_weather_for_city(city) for city in WEATHER_CITIES]
-    health = build_health_summary(disk, cpu_temp, voltage, reachability)
+    weather_reports = [get_weather_for_city(city) for city in CITY_CONFIG]
+    health = build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports)
 
     if cpu_temp["value"] is not None and disk["pct"] is not None:
         update_history_and_graphs(cpu_temp["value"], disk["pct"])
