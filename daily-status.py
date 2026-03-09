@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -443,10 +444,6 @@ def parse_feels_like_from_dia(dia):
 
 
 def get_warning_summary(page_url, zone_name):
-    """
-    Fetch the AEMET warning page and try to find text related to the desired zone.
-    This is a lightweight text extraction approach, not a fragile full-page scraper.
-    """
     try:
         html_text = fetch_text(page_url, timeout=20)
         text = strip_html_tags(html_text)
@@ -466,13 +463,11 @@ def get_warning_summary(page_url, zone_name):
 
         return snippet if snippet else "Warning present"
     except Exception as e:
-        return f"Unavailable ({e.__class__.__name__})"
+        traceback.print_exc()
+        return f"Unavailable ({e.__class__.__name__}: {e})"
 
 
 def get_weather_for_city(city):
-    """
-    Fetch official AEMET daily municipality forecast data plus warning text.
-    """
     config = CITY_CONFIG[city]
 
     try:
@@ -504,6 +499,7 @@ def get_weather_for_city(city):
         }
 
     except Exception as e:
+        traceback.print_exc()
         return {
             "city": city,
             "condition": "Unavailable",
@@ -511,9 +507,8 @@ def get_weather_for_city(city):
             "min_temp": "N/A",
             "feels_like": "N/A",
             "chance_of_rain": "N/A",
-            "warnings": f"Unavailable ({e.__class__.__name__})",
+            "warnings": f"Unavailable ({e.__class__.__name__}: {e})",
         }
-
 
 def build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports=None):
     """
