@@ -528,7 +528,7 @@ def entry_for_today_exists(filepath):
     return f"## {today_str} " in content or f"## {today_str}\n" in content
 
 
-def build_health_summary(disk, cpu_temp, voltage, reachability):
+def build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports=None):
     warnings = []
 
     if disk["pct"] is not None:
