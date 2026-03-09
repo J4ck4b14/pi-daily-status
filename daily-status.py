@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+# Standard library imports
 import datetime
+import html
 import json
 import os
 import random
@@ -9,34 +11,42 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
+# Third-party library for graph generation
 import matplotlib.pyplot as plt
 
+# Absolute path to this Git repository on the Raspberry Pi
 REPO_PATH = "/home/juan/pi-daily-status"
 
 # Scheduling behavior
-SKIP_WEEKDAYS = {6}       # Sunday only; Monday=0 ... Sunday=6
-SKIP_CHANCE = 0.0         # 0.0 = do not randomly skip eligible days
-MIN_DELAY = 0
-MAX_DELAY = 8 * 60 * 60   # up to 8 hours after cron starts
+# Monday=0 ... Sunday=6
+SKIP_WEEKDAYS = {6}       # Skip Sundays
+SKIP_CHANCE = 0.0         # Extra random skip chance; 0.0 means never skip
+MIN_DELAY = 0             # Minimum random delay before running
+MAX_DELAY = 8 * 60 * 60   # Maximum random delay: 8 hours
 
+# A simple connectivity check target
 PING_TARGET = "1.1.1.1"
+
+# AEMET city configuration
+# - municipio_id is used to fetch official municipality XML forecast files
+# - warning_zone and warnings_page are used to look for official warnings
 CITY_CONFIG = {
     "Madrid": {
-	"municipio_id": "28079",
-	"warning_zone": "Metropolitana y Henares",
-	"warnings_page": "https://www.aemet.es/es/eltiempo/prediccion/avisos?k=mad",
+        "municipio_id": "28079",
+        "warning_zone": "Metropolitana y Henares",
+        "warnings_page": "https://www.aemet.es/es/eltiempo/prediccion/avisos?k=mad",
     },
     "Barcelona": {
-	"municipio_id": "08019",
-	"warning_zone": "Litoral de Barcelona",
-	"warnings_page": "https://www.aemet.es/es/eltiempo/prediccion/avisos?k=cat",
+        "municipio_id": "08019",
+        "warning_zone": "Litoral de Barcelona",
+        "warnings_page": "https://www.aemet.es/es/eltiempo/prediccion/avisos?k=cat",
     },
 }
 
-
+# Possible commit messages for daily automatic updates
 COMMIT_MESSAGES = [
     "Add daily system and weather report",
     "Update Pi daily status",
@@ -46,6 +56,10 @@ COMMIT_MESSAGES = [
 
 
 def run(cmd, cwd=REPO_PATH, check=True):
+    """
+    Run a shell command and optionally exit the script if it fails.
+    Used for Git commands and other subprocess operations.
+    """
     result = subprocess.run(
         cmd,
         cwd=cwd,
@@ -61,6 +75,10 @@ def run(cmd, cwd=REPO_PATH, check=True):
 
 
 def command_output(cmd):
+    """
+    Run a command and return stripped stdout.
+    Return None if the command fails.
+    """
     result = subprocess.run(cmd, text=True, capture_output=True)
     if result.returncode != 0:
         return None
@@ -68,11 +86,17 @@ def command_output(cmd):
 
 
 def get_uptime():
+    """
+    Get pretty uptime text, e.g. 'up 1 day, 3 hours'.
+    """
     out = command_output(["uptime", "-p"])
     return out if out else "Unavailable"
 
 
 def get_load_average():
+    """
+    Get 1m, 5m and 15m load averages.
+    """
     try:
         load1, load5, load15 = os.getloadavg()
         return {
@@ -91,6 +115,9 @@ def get_load_average():
 
 
 def get_ram_info():
+    """
+    Read RAM information from /proc/meminfo.
+    """
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -133,6 +160,9 @@ def get_ram_info():
 
 
 def get_disk_info():
+    """
+    Get root filesystem disk usage.
+    """
     try:
         usage = shutil.disk_usage("/")
         total_gb = usage.total / (1024 ** 3)
@@ -158,6 +188,10 @@ def get_disk_info():
 
 
 def get_cpu_temp():
+    """
+    Read CPU temperature from the Raspberry Pi thermal interface,
+    falling back to vcgencmd if needed.
+    """
     thermal_path = "/sys/class/thermal/thermal_zone0/temp"
 
     if os.path.exists(thermal_path):
@@ -189,6 +223,9 @@ def get_cpu_temp():
 
 
 def decode_throttled_flags(value):
+    """
+    Decode Raspberry Pi throttling / undervoltage bit flags.
+    """
     issues = []
 
     flags = {
@@ -210,6 +247,9 @@ def decode_throttled_flags(value):
 
 
 def get_voltage_status():
+    """
+    Read throttling / undervoltage status from vcgencmd.
+    """
     out = command_output(["vcgencmd", "get_throttled"])
     if not out or "throttled=" not in out:
         return {
@@ -239,6 +279,9 @@ def get_voltage_status():
 
 
 def get_reachability():
+    """
+    Perform a basic ping test to confirm outbound reachability.
+    """
     result = subprocess.run(
         ["ping", "-c", "1", "-W", "2", PING_TARGET],
         text=True,
@@ -262,16 +305,11 @@ def get_reachability():
     }
 
 
-def fetch_json(url, timeout=20):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
 def fetch_text(url, timeout=20):
+    """
+    Fetch text content from a URL with a browser-like user agent.
+    Try common encodings used by public sites.
+    """
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0"}
@@ -289,21 +327,25 @@ def fetch_text(url, timeout=20):
 
 
 def aemet_daily_xml_url(municipio_id):
+    """
+    Build the AEMET municipality daily forecast XML URL.
+    """
     return f"https://www.aemet.es/xml/municipios/localidad_{municipio_id}.xml"
 
 
-def aemet_hourly_xml_url(municipio_id):
-    # AEMET hourly municipality XML follows this pattern for municipality IDs.
-    return f"https://www.aemet.es/xml/municipios_h/localidad_h_{municipio_id}.xml"
-
-
 def clean_text(value):
+    """
+    Normalize a value into stripped text.
+    """
     if value is None:
         return ""
     return str(value).strip()
 
 
 def to_int(value):
+    """
+    Convert text to int if possible, else return None.
+    """
     text = clean_text(value)
     if not text:
         return None
@@ -314,6 +356,10 @@ def to_int(value):
 
 
 def strip_html_tags(text):
+    """
+    Remove HTML tags and collapse whitespace.
+    Used to extract readable text from warning pages.
+    """
     text = re.sub(r"<script.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<style.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -323,6 +369,10 @@ def strip_html_tags(text):
 
 
 def get_today_dia_node(root):
+    """
+    Return the XML <dia> node for today if present,
+    otherwise fall back to the first available day.
+    """
     today_str = datetime.date.today().isoformat()
 
     for dia in root.findall(".//dia"):
@@ -335,6 +385,9 @@ def get_today_dia_node(root):
 
 
 def parse_condition_from_dia(dia):
+    """
+    Extract a readable sky condition description from the daily forecast node.
+    """
     descriptions = []
 
     for node in dia.findall(".//estado_cielo"):
@@ -342,19 +395,22 @@ def parse_condition_from_dia(dia):
         if desc and desc not in descriptions:
             descriptions.append(desc)
 
-    if descriptions:
-        return descriptions[0]
-
-    return "Unavailable"
+    return descriptions[0] if descriptions else "Unavailable"
 
 
 def parse_max_min_from_dia(dia):
+    """
+    Extract daily max and min temperatures.
+    """
     maxima = clean_text(dia.findtext(".//temperatura/maxima")) or "N/A"
     minima = clean_text(dia.findtext(".//temperatura/minima")) or "N/A"
     return maxima, minima
 
 
 def parse_rain_chance_from_dia(dia):
+    """
+    Extract the maximum chance of rain from the day forecast blocks.
+    """
     values = []
 
     for node in dia.findall(".//prob_precipitacion"):
@@ -365,52 +421,41 @@ def parse_rain_chance_from_dia(dia):
     return max(values) if values else "N/A"
 
 
-def parse_feels_like_from_hourly_xml(xml_text):
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return "N/A"
+def parse_feels_like_from_dia(dia):
+    """
+    AEMET municipality XML includes sensible temperature sections.
+    We use max/min values when available and estimate a representative
+    feels-like value for the report.
+    """
+    maxima = to_int(dia.findtext(".//sens_termica/maxima"))
+    minima = to_int(dia.findtext(".//sens_termica/minima"))
 
-    today_str = datetime.date.today().isoformat()
-    current_hour = datetime.datetime.now().hour
+    if maxima is not None and minima is not None:
+        return str(round((maxima + minima) / 2))
 
-    best_value = None
-    best_distance = None
+    if maxima is not None:
+        return str(maxima)
 
-    for dia in root.findall(".//dia"):
-        fecha = dia.attrib.get("fecha", "")
-        if not fecha.startswith(today_str):
-            continue
+    if minima is not None:
+        return str(minima)
 
-        for node in dia.findall(".//sens_termica/dato"):
-            hour_attr = node.attrib.get("hora")
-            value = clean_text(node.text)
-
-            if not hour_attr or not value:
-                continue
-
-            try:
-                hour = int(hour_attr)
-            except ValueError:
-                continue
-
-            distance = abs(hour - current_hour)
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_value = value
-
-    return best_value if best_value else "N/A"
+    return "N/A"
 
 
 def get_warning_summary(page_url, zone_name):
+    """
+    Fetch the AEMET warning page and try to find text related to the desired zone.
+    This is a lightweight text extraction approach, not a fragile full-page scraper.
+    """
     try:
         html_text = fetch_text(page_url, timeout=20)
         text = strip_html_tags(html_text)
+        lowered = text.lower()
 
-        if "sin avisos" in text.lower() or "no hay avisos" in text.lower():
+        if "sin avisos" in lowered or "no hay avisos" in lowered:
             return "None reported"
 
-        idx = text.lower().find(zone_name.lower())
+        idx = lowered.find(zone_name.lower())
         if idx == -1:
             return "None reported"
 
@@ -425,6 +470,9 @@ def get_warning_summary(page_url, zone_name):
 
 
 def get_weather_for_city(city):
+    """
+    Fetch official AEMET daily municipality forecast data plus warning text.
+    """
     config = CITY_CONFIG[city]
 
     try:
@@ -438,12 +486,7 @@ def get_weather_for_city(city):
         condition = parse_condition_from_dia(dia)
         max_temp, min_temp = parse_max_min_from_dia(dia)
         chance_of_rain = parse_rain_chance_from_dia(dia)
-
-        try:
-            hourly_xml = fetch_text(aemet_hourly_xml_url(config["municipio_id"]), timeout=20)
-            feels_like = parse_feels_like_from_hourly_xml(hourly_xml)
-        except Exception:
-            feels_like = "N/A"
+        feels_like = parse_feels_like_from_dia(dia)
 
         warnings = get_warning_summary(
             config["warnings_page"],
@@ -471,7 +514,11 @@ def get_weather_for_city(city):
             "warnings": f"Unavailable ({e.__class__.__name__})",
         }
 
+
 def build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports=None):
+    """
+    Produce a simple health summary based on system metrics and weather availability.
+    """
     warnings = []
 
     if disk["pct"] is not None:
@@ -504,6 +551,10 @@ def build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports=
 
 
 def ensure_month_file():
+    """
+    Ensure the current monthly markdown file exists.
+    Example: 2026-03.md
+    """
     today = datetime.date.today()
     filename = f"{today.year}-{today.month:02d}.md"
     filepath = os.path.join(REPO_PATH, filename)
@@ -517,6 +568,9 @@ def ensure_month_file():
 
 
 def entry_for_today_exists(filepath):
+    """
+    Prevent duplicate daily entries in the monthly report file.
+    """
     today_str = datetime.date.today().isoformat()
 
     if not os.path.exists(filepath):
@@ -528,39 +582,11 @@ def entry_for_today_exists(filepath):
     return f"## {today_str} " in content or f"## {today_str}\n" in content
 
 
-def build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports=None):
-    warnings = []
-
-    if disk["pct"] is not None:
-        if disk["pct"] >= 90:
-            warnings.append(f"Disk usage critical ({disk['pct']:.1f}%)")
-        elif disk["pct"] >= 80:
-            warnings.append(f"Disk usage high ({disk['pct']:.1f}%)")
-
-    if cpu_temp["value"] is not None:
-        if cpu_temp["value"] >= 80:
-            warnings.append(f"CPU temperature critical ({cpu_temp['value']:.1f}°C)")
-        elif cpu_temp["value"] >= 70:
-            warnings.append(f"CPU temperature high ({cpu_temp['value']:.1f}°C)")
-
-    if voltage["issues"]:
-        warnings.append(f"Power issue detected: {voltage['text']}")
-
-    if not reachability["reachable"]:
-        warnings.append("Internet unreachable")
-
-    if weather_reports:
-        for report in weather_reports:
-            if report["condition"] == "Unavailable":
-                warnings.append(f"Weather data unavailable for {report['city']}")
-
-    return {
-        "overall": "Warning" if warnings else "Good",
-        "warnings": warnings
-    }
-
-
 def update_history_and_graphs(cpu_temp_value, disk_pct):
+    """
+    Update history.json and regenerate the PNG trend graphs.
+    Only one current graph file is kept for each metric.
+    """
     history_file = os.path.join(REPO_PATH, "history.json")
     today = datetime.date.today().isoformat()
 
@@ -573,6 +599,7 @@ def update_history_and_graphs(cpu_temp_value, disk_pct):
     else:
         history = []
 
+    # Replace today's data if it already exists
     history = [entry for entry in history if entry.get("date") != today]
 
     history.append({
@@ -581,6 +608,7 @@ def update_history_and_graphs(cpu_temp_value, disk_pct):
         "disk": disk_pct
     })
 
+    # Keep only the last 60 days
     history = history[-60:]
 
     with open(history_file, "w", encoding="utf-8") as f:
@@ -590,6 +618,7 @@ def update_history_and_graphs(cpu_temp_value, disk_pct):
     temps = [x["cpu_temp"] for x in history]
     disks = [x["disk"] for x in history]
 
+    # CPU temperature graph
     plt.figure(figsize=(8, 4))
     plt.plot(dates, temps, marker="o")
     plt.xticks(rotation=45, ha="right")
@@ -598,6 +627,7 @@ def update_history_and_graphs(cpu_temp_value, disk_pct):
     plt.savefig(os.path.join(REPO_PATH, "cpu_temp.png"))
     plt.close()
 
+    # Disk usage graph
     plt.figure(figsize=(8, 4))
     plt.plot(dates, disks, marker="o")
     plt.xticks(rotation=45, ha="right")
@@ -608,6 +638,9 @@ def update_history_and_graphs(cpu_temp_value, disk_pct):
 
 
 def build_entry():
+    """
+    Build the full markdown entry for today.
+    """
     now = datetime.datetime.now()
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -622,6 +655,7 @@ def build_entry():
     weather_reports = [get_weather_for_city(city) for city in CITY_CONFIG]
     health = build_health_summary(disk, cpu_temp, voltage, reachability, weather_reports)
 
+    # Update trend history and graphs
     if cpu_temp["value"] is not None and disk["pct"] is not None:
         update_history_and_graphs(cpu_temp["value"], disk["pct"])
 
@@ -673,12 +707,24 @@ def build_entry():
 
 
 def append_entry(filepath):
+    """
+    Append today's report entry to the current monthly markdown file.
+    """
     entry = build_entry()
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(entry)
 
 
 def main():
+    """
+    Main script flow:
+    - respect skip rules unless forced
+    - optionally wait a random delay
+    - pull latest repo changes
+    - avoid duplicate daily entries
+    - append report
+    - stage, commit and push updates
+    """
     force_run = "--force" in sys.argv
 
     now = datetime.datetime.now()
